@@ -32,16 +32,15 @@ from fft_conv import fft_conv
 from torch.fft import rfft, irfft
 import shutil
 from interp1d import Interp1d
+from pyro.poutine import trace, replay
+from .tres import TRES, AnnotatedTres
 
 import scipy.stats as stat
 
 pyro.enable_validation(True)
 
-import warnings
-warnings.filterwarnings('ignore')
 
-
-def trace_mle(cut_time=slice(None, None), sites_to_map=['gp'], obs='I_obs'):
+def trace_mle(cut_time=slice(None, None), sites_to_map=('gp',), obs='I_obs', prior_weight=50):
     def loss_fn(model, guide, *args, **kwargs):
         guide_trace = poutine.trace(guide).get_trace(*args, **kwargs)
         model_trace = poutine.trace(
@@ -51,9 +50,8 @@ def trace_mle(cut_time=slice(None, None), sites_to_map=['gp'], obs='I_obs'):
 
         loss = 0.0
         for site, node in model_trace.nodes.items():
-            #             print(site, site in sites_to_map, sites_to_map)
             if site in sites_to_map:
-                loss -= node['log_prob_sum'] * 50
+                loss -= node['log_prob_sum'] * prior_weight
             if site == obs:
                 loss -= node['fn'].log_prob(node['value']).sum()
 
@@ -72,12 +70,15 @@ def make_step(svi, pbar, time_start, args, kwargs, prefix=''):
 
 
 def make_svi(model, guide, args=None, kwargs=None, steps=1000, lr=0.05, cut_time=slice(None, None), max_steps=2000,
-             ensure_convergence=False):
+             ensure_convergence=False, loss='ELBO'):
     adam_params = {"lr": lr, "betas": (0.90, 0.999), 'weight_decay': 0.005, 'clip_norm': 10}
     optimizer = ClippedAdam(adam_params)
 
     #     svi = SVI(model, guide, optimizer, loss=trace_mle(cut_time))
-    svi = SVI(model, guide, optimizer, loss=JitTrace_ELBO())
+    if loss == 'ELBO':
+        svi = SVI(model, guide, optimizer, loss=JitTrace_ELBO())
+    if loss == 'MLE':
+        svi = SVI(model, guide, optimizer, loss=trace_mle())
 
     pbar = tqdm(range(1, steps + 1))
     time_start = 0
@@ -195,39 +196,7 @@ def spectral_matrix_gp(n_points, plate, suffix=''):
     return S
 
 
-def model_full(data=None, time=None, t0=None,
-               n_components=3, scattering=False, fix_time=False,
-               n_points=None, time_padded=None, irf_padded=None):
-    components_plate = pyro.plate('components', n_components)
-
-    if fix_time:
-        t0 = pyro.deterministic('t0', t0)
-    else:
-        t0 = pyro.sample('t0', dist.Normal(loc=t0, scale=0.01))
-    xi = pyro.sample('xi', dist.Exponential(torch.rand(n_points) / 10).to_event(1))
-
-    irf = Interp1d()(time_padded, irf_padded, time - t0, None)
-
-    T_scaled = time_matrix(time, irf, t0, components_plate, suffix='')
-    S = spectral_matrix_gp(n_points, components_plate, suffix='')
-    ST = pyro.deterministic('ST', S.T @ T_scaled, event_dim=2)
-
-    if scattering:
-        scattering_plate = pyro.plate('scattering', 1)
-        T_sc = time_matrix(time, irf, t0, scattering_plate, suffix='sc', scattering=True)
-        S_sc = spectral_matrix_unscaled(n_points, scattering_plate, suffix='sc') * 20
-        ST_sc = pyro.deterministic('ST_sc', S_sc.T @ T_sc, event_dim=2)
-        ST = ST + ST_sc
-
-    #     prob = pyro.sample('prob', dist.Beta(1, 1))
-    if data is not None:
-        data = data
-    #     I = pyro.sample('lol', dist.NegativeBinomial(ST.T[:] + xi, probs=prob).to_event(2), obs=data)
-    I = pyro.sample('I_obs', dist.Poisson(ST.T + xi).to_event(2), obs=data)
-    _ = pyro.deterministic('I', ST.T + xi, event_dim=2)
-
-
-def AutoMixed(modell_full, init_loc={}, delta=None):
+def AutoMixed(model_full, init_loc={}, delta=None):
     guide = AutoGuideList(model_full)
 
     marginalised_guide_block = poutine.block(model_full, expose_all=True, hide_all=False, hide=['tau'])
@@ -247,5 +216,116 @@ def AutoMixed(modell_full, init_loc={}, delta=None):
     return guide
 
 
-class TresSolverVI():
-    ...
+class TresSolverVI(TRES):
+    """
+    Class for solving TRES using NNLS.
+    """
+    def __init__(self, X, time, irf,
+                 n_components=2,
+                 time_slice=slice(None, None),
+                 wavelength_slice=slice(None, None),
+                 scattering=True,
+                 wavelenghths=None,
+                 padding_length=2500,
+                 t0=0.):
+        """
+        Parameters
+        ----------
+        X : np.array
+            TRES matrix n_time x n_wavelength
+        time : np.array
+            The time points measurments were made at (size n_time)
+        irf : np.array
+            Measures IRF (size n_time)
+        n_components : int
+            Number of components in a luminophore mixture
+        time_slice : slice
+            Use to crop data
+        wavelength_slice : slice
+            Use to crop data
+        scattering : bool
+            Take scatering into account?
+        wavelenghths : np.array
+        padding_length : int
+            IRF circular padding length
+        t0 : float ot None
+            IRF shift - not computed, if provided
+        """
+
+        super().__init__(X, time, irf)
+
+        assert len(time) == len(irf)
+        assert len(time) == len(X)
+
+        self.time_slice = time_slice
+        self.wavelength_slice = wavelength_slice
+        self.scattering = scattering
+        self.wavelenghs = wavelenghths
+        self.n_components = n_components
+        self.n_wavelenghs = X.shape[-1]
+
+        self.t0 = t0
+
+        if len(time) < padding_length * 2:
+            padding_length = len(time) // 3
+        self.time_padded = self.extend_time(time, padding_length).astype(np.float64)
+        self.irf_padded = self.circular_pad(irf, padding_length).astype(np.float64)
+        self.tres_annot = None
+
+
+    @staticmethod
+    def circular_pad(t, n):
+        return torch.tensor(np.concatenate([t[-n:], t, t[:n]]))
+
+    @staticmethod
+    def extend_time(t, n):
+        diff = t[1] - t[0]
+        start = np.arange(t[0] - n * diff, t[0], diff)
+        end = np.arange(t[-1] + diff, t[-1] + (n + 1) * diff, diff)
+        return torch.tensor(np.concatenate([start, t, end]))
+
+    def model_full(self, data=None, time=None, fix_time=False):
+        components_plate = pyro.plate('components', self.n_components)
+
+        if fix_time:
+            t0 = pyro.deterministic('t0', self.t0)
+        else:
+            t0 = pyro.sample('t0', dist.Normal(loc=self.t0, scale=0.01))
+        xi = pyro.sample('xi', dist.Exponential(torch.rand(self.n_wavelenghs) / 10).to_event(1))
+
+        irf = Interp1d()(self.time_padded, self.irf_padded, time - t0, None)
+
+        T_scaled = time_matrix(time, irf, t0, components_plate, suffix='')
+        S = spectral_matrix_gp(self.n_wavelenghs, components_plate, suffix='')
+        ST = pyro.deterministic('ST', S.T @ T_scaled, event_dim=2)
+
+        if self.scattering:
+            scattering_plate = pyro.plate('scattering', 1)
+            T_sc = time_matrix(time, irf, t0, scattering_plate, suffix='sc', scattering=True)
+            S_sc = spectral_matrix_unscaled(self.n_wavelenghs, scattering_plate, suffix='sc') * 20
+            ST_sc = pyro.deterministic('ST_sc', S_sc.T @ T_sc, event_dim=2)
+            ST = ST + ST_sc
+
+        if data is not None:
+            data = data[self.time_slice][self.wavelength_slice]
+        pyro.sample('I_obs', dist.Poisson((ST.T + xi)[self.time_slice][self.wavelength_slice]).to_event(2), obs=data)
+        pyro.deterministic('I', ST.T + xi, event_dim=2)
+
+    def solve(self):
+
+        pyro.clear_param_store()
+        torch.set_default_tensor_type(torch.DoubleTensor)
+
+        guide = pyro.infer.autoguide.AutoDelta(self.model_full, init_loc_fn=pyro.infer.autoguide.init_to_sample)
+        device = 'cpu'
+
+        data_tensor, time_tensor, irf_tensor = (torch.DoubleTensor(i).to(device) for i in [self.X, self.time, self.irf])
+        args = []
+        kwargs = {'data': data_tensor,
+                  'time': time_tensor,
+                  'irf': irf_tensor,
+                  'fix_time': False}
+
+        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=850, lr=0.05, ensure_convergence=True)
+        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=1850, lr=0.003, ensure_convergence=False)
+        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=1850, lr=0.0001, ensure_convergence=True)
