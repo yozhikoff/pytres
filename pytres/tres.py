@@ -10,7 +10,7 @@ from matplotlib.ticker import MaxNLocator
 def get_uniform_grid_on_sphere(n, r=1):
     """
     Parameters
-    ----------
+    ----------git
     n : int
         Number of points
     r : float
@@ -165,7 +165,8 @@ class AnnotatedTres(TRES):
                 ax.secondary_xaxis(loc, functions=(lambda x: x, lambda x: x))
 
     @classmethod
-    def from_trace(cls, trace, tres):
+    def from_trace(cls, trace, tres, wavelength_slice=slice(None, None),
+                   time_slice=slice(None, None), wavelengths=None):
         """
         Create class instance from Pyro trace
 
@@ -199,7 +200,8 @@ class AnnotatedTres(TRES):
         X = tres.X
         time = tres.time
         irf = tres.irf
-        return cls(X, time, spectra, lifetimes, scattering_spectra, scattering_time, t_start, X_sim, trace, bg, irf)
+        return cls(X, time, spectra, lifetimes, scattering_spectra, scattering_time, t_start, X_sim, trace, bg, irf,
+                   wavelength_slice=wavelength_slice, time_slice=time_slice, wavelengths=wavelengths)
 
     @classmethod
     def from_scipy(cls, tres, trace, fun, args):

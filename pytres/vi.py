@@ -1,41 +1,23 @@
-# import sys
-# sys.path.append('pytres/')
-
+import time as time_module
+import warnings
 
 import numpy as np
-import pandas as pd
-from matplotlib import pyplot as plt
-import time as time_module
-import os
-from tqdm.auto import tqdm
-
-from pytres.pytres import tres
-from pyro import poutine
-
-from pyro.infer import MCMC, NUTS, Predictive
-import torch
-from torch.nn import functional as F
-import torch.nn
 import pyro
-from pyro import distributions as dist
-import torch
-import torch.distributions.constraints as constraints
-import torch.nn.functional as F
-import pyro
-from pyro.optim import ClippedAdam
-from pyro.infer import SVI, Trace_ELBO, SVGD, RBFSteinKernel, JitTrace_ELBO
-from pyro.infer import Predictive
-from pyro.infer.autoguide import AutoDelta, AutoNormal, AutoMultivariateNormal, AutoGuideList
-from pyro.infer import autoguide
 import pyro.distributions as dist
-from fft_conv import fft_conv
-from torch.fft import rfft, irfft
-import shutil
-from interp1d import Interp1d
-from pyro.poutine import trace, replay
-from .tres import TRES, AnnotatedTres
-
 import scipy.stats as stat
+import torch
+import torch.nn
+import torch.nn.functional as F
+from pyro import poutine
+from pyro.infer import Predictive
+from pyro.infer import SVI, JitTraceEnum_ELBO
+from pyro.infer import autoguide
+from pyro.infer.autoguide import AutoDelta, AutoNormal, AutoMultivariateNormal, AutoGuideList
+from pyro.optim import ClippedAdam
+from pytres import TRES, AnnotatedTres
+from pytres.interp1d import Interp1d
+from torch.fft import rfft, irfft
+from tqdm.auto import tqdm
 
 pyro.enable_validation(True)
 
@@ -76,7 +58,7 @@ def make_svi(model, guide, args=None, kwargs=None, steps=1000, lr=0.05, cut_time
 
     #     svi = SVI(model, guide, optimizer, loss=trace_mle(cut_time))
     if loss == 'ELBO':
-        svi = SVI(model, guide, optimizer, loss=JitTrace_ELBO())
+        svi = SVI(model, guide, optimizer, loss=JitTraceEnum_ELBO())
     if loss == 'MLE':
         svi = SVI(model, guide, optimizer, loss=trace_mle())
 
@@ -113,10 +95,7 @@ def conv1d(signal, kernel, mode='fft_circular', cut=False, cut_lim=150):
     """
     kernel_size = int(kernel.shape[-1])
 
-    if mode == 'fft':
-        conved = fft_conv(signal.unsqueeze(1), kernel.flip(0).unsqueeze(0).unsqueeze(0), padding=kernel_size - 1)[:, 0]
-
-    elif mode == 'direct':
+    if mode == 'direct':
         conved = F.conv1d(signal.unsqueeze(1), kernel.flip(0).unsqueeze(0).unsqueeze(0), padding=kernel_size - 1)[:, 0]
 
     elif mode == 'fft_circular':
@@ -203,11 +182,11 @@ def AutoMixed(model_full, init_loc={}, delta=None):
     if delta is None:
         guide.append(
             AutoNormal(marginalised_guide_block, init_loc_fn=autoguide.init_to_value(values=init_loc), init_scale=0.05))
-    elif delta is 'part' or delta is 'all':
+    elif delta == 'part' or delta == 'all':
         guide.append(AutoDelta(marginalised_guide_block, init_loc_fn=autoguide.init_to_value(values=init_loc)))
 
     full_rank_guide_block = poutine.block(model_full, hide_all=True, expose=['tau'])
-    if delta is None or delta is 'part':
+    if delta is None or delta == 'part':
         guide.append(AutoMultivariateNormal(full_rank_guide_block, init_loc_fn=autoguide.init_to_value(values=init_loc),
                                             init_scale=0.05))
     else:
@@ -216,18 +195,32 @@ def AutoMixed(model_full, init_loc={}, delta=None):
     return guide
 
 
+def create_init_trace(tres_annot):
+    values = {}
+    values['t0'] = tres_annot.t_start
+    values['S'] = tres_annot.spectra / 20 + 0.0001
+    values['gp'] = tres_annot.spectra / 20 / 50 + 0.0001
+    values['S_sc'] = tres_annot.scattering_spectra[None, ...] / 20 + 0.0001
+    values['tau'] = tres_annot.lifetimes
+    values['xi'] = tres_annot.bg
+
+    return {k: torch.tensor(v) for k, v in values.items()}
+
+
 class TresSolverVI(TRES):
     """
     Class for solving TRES using NNLS.
     """
+
     def __init__(self, X, time, irf,
                  n_components=2,
                  time_slice=slice(None, None),
                  wavelength_slice=slice(None, None),
                  scattering=True,
-                 wavelenghths=None,
+                 wavelengths=None,
                  padding_length=2500,
-                 t0=0.):
+                 t0=0.,
+                 initial_trace=None):
         """
         Parameters
         ----------
@@ -245,7 +238,7 @@ class TresSolverVI(TRES):
             Use to crop data
         scattering : bool
             Take scatering into account?
-        wavelenghths : np.array
+        wavelengths : np.array
         padding_length : int
             IRF circular padding length
         t0 : float ot None
@@ -260,7 +253,7 @@ class TresSolverVI(TRES):
         self.time_slice = time_slice
         self.wavelength_slice = wavelength_slice
         self.scattering = scattering
-        self.wavelenghs = wavelenghths
+        self.wavelengths = wavelengths
         self.n_components = n_components
         self.n_wavelenghs = X.shape[-1]
 
@@ -268,10 +261,11 @@ class TresSolverVI(TRES):
 
         if len(time) < padding_length * 2:
             padding_length = len(time) // 3
-        self.time_padded = self.extend_time(time, padding_length).astype(np.float64)
-        self.irf_padded = self.circular_pad(irf, padding_length).astype(np.float64)
+        self.time_padded = self.extend_time(time, padding_length).float()
+        self.irf_padded = self.circular_pad(irf, padding_length).float()
         self.tres_annot = None
 
+        self.initial_trace = initial_trace
 
     @staticmethod
     def circular_pad(t, n):
@@ -316,16 +310,43 @@ class TresSolverVI(TRES):
         pyro.clear_param_store()
         torch.set_default_tensor_type(torch.DoubleTensor)
 
-        guide = pyro.infer.autoguide.AutoDelta(self.model_full, init_loc_fn=pyro.infer.autoguide.init_to_sample)
+        if self.initial_trace is not None:
+            guide = AutoMixed(self.model_full, init_loc=self.initial_trace)
+        else:
+            guide = AutoMixed(self.model_full, delta=None)
         device = 'cpu'
 
         data_tensor, time_tensor, irf_tensor = (torch.DoubleTensor(i).to(device) for i in [self.X, self.time, self.irf])
         args = []
         kwargs = {'data': data_tensor,
                   'time': time_tensor,
-                  'irf': irf_tensor,
                   'fix_time': False}
 
-        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=850, lr=0.05, ensure_convergence=True)
-        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=1850, lr=0.003, ensure_convergence=False)
-        make_svi(self.model_full, guide, args, kwargs=kwargs, steps=1850, lr=0.0001, ensure_convergence=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            make_svi(self.model_full, guide, args, kwargs=kwargs, steps=1000, lr=0.05, ensure_convergence=True)
+            make_svi(self.model_full, guide, args, kwargs=kwargs, steps=2500, lr=0.003, ensure_convergence=False)
+            make_svi(self.model_full, guide, args, kwargs=kwargs, steps=3500, lr=0.0001, ensure_convergence=True)
+
+        tres_data = TRES(X=kwargs['data'].cpu().numpy(), time=self.time, irf=self.irf)
+        trace = Predictive(self.model_full, guide=guide, num_samples=5)(**{**kwargs, **{'data': None}})
+        tres_annot = AnnotatedTres.from_trace(trace, tres_data, wavelengths=self.wavelengths,
+                                              time_slice=self.time_slice,
+                                              wavelength_slice=self.wavelength_slice)
+
+        self.guide = guide
+
+        return tres_annot
+
+    def compute_confidence_indervals(self):
+
+        pt = torch.stack(self.guide[1].quantiles([0.005, 0.995])['tau'], dim=0).detach().numpy()
+        ci_max = pt.max(axis=0)
+        ci_min = pt.min(axis=0)
+
+        print('Lifetimes CI:')
+        for min_val, max_val in zip(ci_min, ci_max):
+            mean = (min_val + max_val) / 2
+            print(f'{mean :.4f} +/- {(max_val - mean) :.4f}')
+
+        return ci_min, ci_max

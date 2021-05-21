@@ -7,7 +7,7 @@ from numpy.fft import irfft, rfft
 from scipy import stats as stat
 from tqdm.notebook import tqdm
 
-from pytres.pytres import TRES, AnnotatedTres, get_uniform_grid_on_sphere
+from pytres.tres import TRES, AnnotatedTres, get_uniform_grid_on_sphere
 
 
 class TresSolverNNLS(TRES):
@@ -19,7 +19,7 @@ class TresSolverNNLS(TRES):
                  time_slice=slice(None, None),
                  wavelength_slice=slice(None, None),
                  scattering=True,
-                 wavelenghths=None,
+                 wavelengths=None,
                  padding_length=2500,
                  t0=None):
         """
@@ -39,7 +39,7 @@ class TresSolverNNLS(TRES):
             Use to crop data
         scattering : bool
             Take scatering into account?
-        wavelenghths : np.array
+        wavelengths : np.array
         padding_length : int
             IRF circular padding length
         t0 : float ot None
@@ -50,7 +50,7 @@ class TresSolverNNLS(TRES):
         self.time_slice = time_slice
         self.wavelength_slice = wavelength_slice
         self.scattering = scattering
-        self.wavelenghs = wavelenghths
+        self.wavelengths = wavelengths
         self.n_components = n_components
 
         self.t0 = t0
@@ -201,7 +201,7 @@ class TresSolverNNLS(TRES):
         irf = self.irf
         trace = None
         return AnnotatedTres(X, time, spectra, lifetimes, scattering_spectra, scattering_time,
-                             t_start, X_sim, trace, bg, irf, wavelengths=self.wavelenghs, time_slice=self.time_slice,
+                             t_start, X_sim, trace, bg, irf, wavelengths=self.wavelengths, time_slice=self.time_slice,
                              wavelength_slice=self.wavelength_slice)
 
     def compute_confidence_indervals(self, random=True):
@@ -239,8 +239,6 @@ class TresSolverNNLS(TRES):
         else:
             print(basis_coefs)
             print(np.power(np.diag(1 / basis_coefs), 1))
-            # dist = stat.multivariate_normal(mean=np.zeros((self.n_components,)), cov=np.power(np.diag(
-            # 1/basis_coefs), 1/6))
             dist = stat.multivariate_normal(mean=np.zeros((self.n_components,)), cov=1)
             vectors = dist.rvs(100 * self.n_components ** 2).T
             vectors = (vectors / np.sqrt((vectors ** 2).sum(axis=0))).T
